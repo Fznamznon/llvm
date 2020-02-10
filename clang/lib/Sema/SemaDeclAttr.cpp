@@ -7763,6 +7763,13 @@ void Sema::ProcessDeclAttributes(Scope *S, Decl *D, const Declarator &PD) {
 static bool isForbiddenTypeAllowed(Sema &S, Decl *D,
                                    const DelayedDiagnostic &diag,
                                    UnavailableAttr::ImplicitReason &reason) {
+  // SYCL: delay the diagnostic until we know that the function will be actually
+  // emitted
+  if (S.getLangOpts().SYCLIsDevice) {
+    reason = UnavailableAttr::IR_SYCLForbiddenType;
+    return true;
+  }
+
   // Private ivars are always okay.  Unfortunately, people don't
   // always properly make their ivars private, even in system headers.
   // Plus we need to make fields okay, too.

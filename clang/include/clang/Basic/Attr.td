@@ -2317,7 +2317,8 @@ def Unavailable : InheritableAttr {
                  "IR_ForbiddenWeak",
                  "IR_ARCForbiddenConversion",
                  "IR_ARCInitReturnsUnrelated",
-                 "IR_ARCFieldWithOwnership"], 1, /*fake*/ 1>];
+                 "IR_ARCFieldWithOwnership",
+                 "IR_SYCLForbiddenType"], 1, /*fake*/ 1>];
   let Documentation = [Undocumented];
 }
 

@@ -1516,10 +1516,21 @@ static QualType ConvertDeclSpecToType(TypeProcessingState &state) {
     break;
   case DeclSpec::TST_float128:
     if (!S.Context.getTargetInfo().hasFloat128Type() &&
+        !S.getLangOpts().SYCLIsDevice &&
         !(S.getLangOpts().OpenMP && S.getLangOpts().OpenMPIsDevice))
       S.Diag(DS.getTypeSpecTypeLoc(), diag::err_type_unsupported)
         << "__float128";
     Result = Context.Float128Ty;
+    if (!S.Context.getTargetInfo().hasFloat128Type() &&
+        S.getLangOpts().SYCLIsDevice &&
+        S.DelayedDiagnostics.shouldDelayDiagnostics()) {
+      S.DelayedDiagnostics.add(sema::DelayedDiagnostic::makeForbiddenType(
+          DS.getTypeSpecTypeLoc(), diag::err_type_unsupported, Result,
+          /*ignored*/ 0));
+      S.SYCLDiagIfDeviceCode(DS.getTypeSpecTypeLoc(),
+                             diag::err_type_unsupported)
+          << Result;
+    }
     break;
   case DeclSpec::TST_bool: Result = Context.BoolTy; break; // _Bool or bool
     break;

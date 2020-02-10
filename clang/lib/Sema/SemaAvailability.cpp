@@ -474,6 +474,10 @@ static void DoEmitAvailabilityWarning(Sema &S, AvailabilityResult K,
           flagARCError();
           diag_available_here = diag::note_arc_field_with_ownership;
           break;
+
+        case UnavailableAttr::IR_SYCLForbiddenType:
+          diag_available_here = diag::err_type_unsupported;
+          break;
         }
       }
     }
@@ -526,7 +530,10 @@ static void DoEmitAvailabilityWarning(Sema &S, AvailabilityResult K,
       S.Diag(ObjCProperty->getLocation(), diag::note_property_attribute)
           << ObjCProperty->getDeclName() << property_note_select;
   } else if (!UnknownObjCClass) {
-    S.Diag(Loc, diag) << ReferringDecl << FixIts;
+    if (S.getLangOpts().SYCLIsDevice)
+      S.SYCLDiagIfDeviceCode(Loc, diag) << ReferringDecl;
+    else
+      S.Diag(Loc, diag) << ReferringDecl << FixIts;
     if (ObjCProperty)
       S.Diag(ObjCProperty->getLocation(), diag::note_property_attribute)
           << ObjCProperty->getDeclName() << property_note_select;
@@ -535,8 +542,12 @@ static void DoEmitAvailabilityWarning(Sema &S, AvailabilityResult K,
     S.Diag(UnknownObjCClass->getLocation(), diag::note_forward_class);
   }
 
-  S.Diag(NoteLocation, diag_available_here)
-    << OffendingDecl << available_here_select_kind;
+  if (S.getLangOpts().SYCLIsDevice)
+    S.SYCLDiagIfDeviceCode(NoteLocation, diag_available_here)
+        << cast<ValueDecl>(OffendingDecl)->getType();
+  else
+    S.Diag(NoteLocation, diag_available_here)
+        << OffendingDecl << available_here_select_kind;
 }
 
 void Sema::handleDelayedAvailabilityCheck(DelayedDiagnostic &DD, Decl *Ctx) {

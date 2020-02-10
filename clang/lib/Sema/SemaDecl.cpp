@@ -18024,6 +18024,11 @@ Decl *Sema::getObjCDeclContext() const {
 }
 
 Sema::FunctionEmissionStatus Sema::getEmissionStatus(FunctionDecl *FD) {
+  // Due to SYCL functions can be template we check if they have appropriate
+  // attribute prior to checking if it is a template
+  if (LangOpts.SYCLIsDevice && FD->hasAttr<SYCLKernelAttr>())
+    return FunctionEmissionStatus::Emitted;
+
   // Templates are emitted when they're instantiated.
   if (FD->isDependentContext())
     return FunctionEmissionStatus::TemplateDiscarded;
