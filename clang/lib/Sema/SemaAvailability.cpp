@@ -474,6 +474,7 @@ static void DoEmitAvailabilityWarning(Sema &S, AvailabilityResult K,
           flagARCError();
           diag_available_here = diag::note_arc_field_with_ownership;
           break;
+
         }
       }
     }
