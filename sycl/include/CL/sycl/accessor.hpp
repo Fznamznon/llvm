@@ -975,6 +975,11 @@ public:
   using reference = DataT &;
   using const_reference = const DataT &;
 
+  using AccessorIterator = ConcreteASPtrType;
+
+  AccessorIterator begin() const { return getQualifiedPtr(); }
+  AccessorIterator end() const { return &getQualifiedPtr()[size()]; }
+
   // The list of accessor constructors with their arguments
   // -------+---------+-------+----+-----+--------------
   // Dimensions = 0
@@ -2088,6 +2093,10 @@ public:
   using value_type = DataT;
   using reference = DataT &;
   using const_reference = const DataT &;
+  using AccessorIterator = ConcreteASPtrType;
+
+  AccessorIterator begin() const { return getQualifiedPtr(); }
+  AccessorIterator end() const { return getQualifiedPtr()[size()]; }
 
   template <int Dims = Dimensions, typename = detail::enable_if_t<Dims == 0>>
   accessor(handler &, const detail::code_location CodeLoc =
