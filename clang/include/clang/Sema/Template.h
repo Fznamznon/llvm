@@ -158,6 +158,14 @@ enum class TemplateSubstitutionKind : char {
       return !(*this)(Depth, Index).isNull();
     }
 
+    bool isAnyArgInstantiationDependent() const {
+      for (ArgList List : TemplateArgumentLists)
+        for (const TemplateArgument &TA : List)
+          if (TA.isInstantiationDependent())
+            return true;
+      return false;
+    }
+
     /// Clear out a specific template argument.
     void setArgument(unsigned Depth, unsigned Index,
                      TemplateArgument Arg) {
@@ -196,6 +204,11 @@ enum class TemplateSubstitutionKind : char {
     /// Retrieve the innermost template argument list.
     const ArgList &getInnermost() const {
       return TemplateArgumentLists.front();
+    }
+
+    /// Retrieve the outermost template argument list.
+    const ArgList &getOutermost() const {
+      return TemplateArgumentLists.back();
     }
   };
 

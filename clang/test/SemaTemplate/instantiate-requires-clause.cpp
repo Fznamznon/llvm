@@ -40,6 +40,18 @@ struct S {
 
 static_assert(S<void>::f(1));
 
+// Similar to the 'S' test, but tries to use 'U' in the requires clause.
+template<typename T2>
+struct S1 {
+  // expected-note@+3 {{candidate template ignored: constraints not satisfied [with U = int]}}
+  // expected-note@+2 {{because substituted constraint expression is ill-formed: type 'int' cannot be used prior to '::' because it has no members}}
+  template <typename U>
+  static constexpr auto f(U const index) requires(U::foo) { return true; }
+};
+
+// expected-error@+1 {{no matching function for call to 'f'}}
+static_assert(S1<void>::f(1));
+
 constexpr auto value = 0;
 
 template<typename T>

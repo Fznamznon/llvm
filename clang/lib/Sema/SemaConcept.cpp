@@ -30,6 +30,7 @@ using namespace sema;
 
 namespace {
 class LogicalBinOp {
+  SourceLocation Loc;
   OverloadedOperatorKind Op = OO_None;
   const Expr *LHS = nullptr;
   const Expr *RHS = nullptr;
@@ -40,12 +41,14 @@ public:
       Op = BinaryOperator::getOverloadedOperator(BO->getOpcode());
       LHS = BO->getLHS();
       RHS = BO->getRHS();
+      Loc = BO->getExprLoc();
     } else if (auto *OO = dyn_cast<CXXOperatorCallExpr>(E)) {
       // If OO is not || or && it might not have exactly 2 arguments.
       if (OO->getNumArgs() == 2) {
         Op = OO->getOperator();
         LHS = OO->getArg(0);
         RHS = OO->getArg(1);
+        Loc = OO->getOperatorLoc();
       }
     }
   }
@@ -56,6 +59,22 @@ public:
 
   const Expr *getLHS() const { return LHS; }
   const Expr *getRHS() const { return RHS; }
+
+  ExprResult recreateBinOp(Sema &SemaRef, ExprResult LHS) {
+    return recreateBinOp(SemaRef, LHS, const_cast<Expr *>(getRHS()));
+  }
+
+  ExprResult recreateBinOp(Sema &SemaRef, ExprResult LHS, ExprResult RHS) {
+    assert((isAnd() || isOr()) && "Not the right kind of op?");
+    assert((!LHS.isInvalid() && !RHS.isInvalid()) && "not good expressions?");
+    assert(LHS.isUsable() && RHS.isUsable() && "Side not usable?");
+    // We should just be able to 'normalize' these to the builtin Binary
+    // Operator, since that is how they are evaluated in constriant checks.
+    return BinaryOperator::Create(SemaRef.Context, LHS.get(), RHS.get(),
+                                  BinaryOperator::getOverloadedOpcode(Op),
+                                  SemaRef.Context.BoolTy, VK_PRValue,
+                                  OK_Ordinary, Loc, FPOptionsOverride{});
+  }
 };
 }
 
@@ -122,16 +141,18 @@ bool Sema::CheckConstraintExpression(const Expr *ConstraintExpression,
 }
 
 template <typename AtomicEvaluator>
-static bool
+static ExprResult
 calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
                                 ConstraintSatisfaction &Satisfaction,
                                 AtomicEvaluator &&Evaluator) {
   ConstraintExpr = ConstraintExpr->IgnoreParenImpCasts();
 
   if (LogicalBinOp BO = ConstraintExpr) {
-    if (calculateConstraintSatisfaction(S, BO.getLHS(), Satisfaction,
-                                        Evaluator))
-      return true;
+    ExprResult LHSRes = calculateConstraintSatisfaction(
+        S, BO.getLHS(), Satisfaction, Evaluator);
+
+    if (LHSRes.isInvalid())
+      return ExprError();
 
     bool IsLHSSatisfied = Satisfaction.IsSatisfied;
 
@@ -142,7 +163,8 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
       //    is checked. If that is satisfied, the disjunction is satisfied.
       //    Otherwise, the disjunction is satisfied if and only if the second
       //    operand is satisfied.
-      return false;
+      return LHSRes.isUsable() ? BO.recreateBinOp(S, LHSRes) : ExprEmpty();
+      //return BO.recreateBinOp(S, LHSRes);
 
     if (BO.isAnd() && !IsLHSSatisfied)
       // [temp.constr.op] p2
@@ -151,12 +173,22 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
       //    is checked. If that is not satisfied, the conjunction is not
       //    satisfied. Otherwise, the conjunction is satisfied if and only if
       //    the second operand is satisfied.
-      return false;
+      return LHSRes.isUsable() ? BO.recreateBinOp(S, LHSRes) : ExprEmpty();
+      // return BO.recreateBinOp(S, LHSRes);
 
-    return calculateConstraintSatisfaction(
+    ExprResult RHSRes = calculateConstraintSatisfaction(
         S, BO.getRHS(), Satisfaction, std::forward<AtomicEvaluator>(Evaluator));
+    if (RHSRes.isInvalid())
+      return ExprError();
+
+    if (!LHSRes.isUsable() || !RHSRes.isUsable())
+      return ExprEmpty();
+    return BO.recreateBinOp(S, LHSRes, RHSRes);
   } else if (auto *C = dyn_cast<ExprWithCleanups>(ConstraintExpr)) {
-    return calculateConstraintSatisfaction(S, C->getSubExpr(), Satisfaction,
+    // These aren't evaluated, so we don't care about cleanups, so we can just
+    // evaluate these as if the cleanups didn't exist.
+    return calculateConstraintSatisfaction(
+        S, C->getSubExpr(), Satisfaction,
         std::forward<AtomicEvaluator>(Evaluator));
   }
 
@@ -164,11 +196,11 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
   ExprResult SubstitutedAtomicExpr = Evaluator(ConstraintExpr);
 
   if (SubstitutedAtomicExpr.isInvalid())
-    return true;
+    return ExprError();
 
   if (!SubstitutedAtomicExpr.isUsable())
     // Evaluator has decided satisfaction without yielding an expression.
-    return false;
+    return ExprEmpty();
 
   EnterExpressionEvaluationContext ConstantEvaluated(
       S, Sema::ExpressionEvaluationContext::ConstantEvaluated);
@@ -185,7 +217,7 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
         << SubstitutedAtomicExpr.get()->getSourceRange();
     for (const PartialDiagnosticAt &PDiag : EvaluationDiags)
       S.Diag(PDiag.first, PDiag.second);
-    return true;
+    return ExprError();
   }
 
   assert(EvalResult.Val.isInt() &&
@@ -195,13 +227,13 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
     Satisfaction.Details.emplace_back(ConstraintExpr,
                                       SubstitutedAtomicExpr.get());
 
-  return false;
+  return SubstitutedAtomicExpr;
 }
 
-static bool calculateConstraintSatisfaction(
-    Sema &S, const NamedDecl *Template, ArrayRef<TemplateArgument> TemplateArgs,
-    SourceLocation TemplateNameLoc, MultiLevelTemplateArgumentList &MLTAL,
-    const Expr *ConstraintExpr, ConstraintSatisfaction &Satisfaction) {
+static ExprResult calculateConstraintSatisfaction(
+    Sema &S, const NamedDecl *Template, SourceLocation TemplateNameLoc,
+    const MultiLevelTemplateArgumentList &MLTAL, const Expr *ConstraintExpr,
+    ConstraintSatisfaction &Satisfaction) {
   return calculateConstraintSatisfaction(
       S, ConstraintExpr, Satisfaction, [&](const Expr *AtomicExpr) {
         EnterExpressionEvaluationContext ConstantEvaluated(
@@ -219,8 +251,8 @@ static bool calculateConstraintSatisfaction(
             return ExprError();
           // We do not want error diagnostics escaping here.
           Sema::SFINAETrap Trap(S);
-          SubstitutedExpression = S.SubstExpr(const_cast<Expr *>(AtomicExpr),
-                                              MLTAL);
+          SubstitutedExpression =
+              S.SubstConstraintExpr(const_cast<Expr *>(AtomicExpr), MLTAL);
           // Substitution might have stripped off a contextual conversion to
           // bool if this is the operand of an '&&' or '||'. For example, we
           // might lose an lvalue-to-rvalue conversion here. If so, put it back
@@ -268,55 +300,70 @@ static bool calculateConstraintSatisfaction(
       });
 }
 
-static bool CheckConstraintSatisfaction(Sema &S, const NamedDecl *Template,
-                                        ArrayRef<const Expr *> ConstraintExprs,
-                                        ArrayRef<TemplateArgument> TemplateArgs,
-                                        SourceRange TemplateIDRange,
-                                        ConstraintSatisfaction &Satisfaction) {
+static bool CheckConstraintSatisfaction(
+    Sema &S, const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
+    llvm::SmallVectorImpl<Expr*> &Converted,
+    const MultiLevelTemplateArgumentList &TemplateArgsList,
+    SourceRange TemplateIDRange, ConstraintSatisfaction &Satisfaction) {
   if (ConstraintExprs.empty()) {
     Satisfaction.IsSatisfied = true;
     return false;
   }
 
-  for (auto& Arg : TemplateArgs)
-    if (Arg.isInstantiationDependent()) {
-      // No need to check satisfaction for dependent constraint expressions.
-      Satisfaction.IsSatisfied = true;
-      return false;
-    }
+  if (TemplateArgsList.isAnyArgInstantiationDependent()) {
+    //  No need to check satisfaction for dependent constraint expressions.
+    Satisfaction.IsSatisfied = true;
+    return false;
+  }
 
-  Sema::InstantiatingTemplate Inst(S, TemplateIDRange.getBegin(),
+  ArrayRef<TemplateArgument> TemplateArgs =
+      TemplateArgsList.getNumSubstitutedLevels() > 0
+          ? TemplateArgsList.getOutermost()
+          : ArrayRef<TemplateArgument>{};
+
+  Sema::InstantiatingTemplate Inst(
+      S, TemplateIDRange.getBegin(),
       Sema::InstantiatingTemplate::ConstraintsCheck{},
-      const_cast<NamedDecl *>(Template), TemplateArgs, TemplateIDRange);
+      const_cast<NamedDecl *>(Template), TemplateArgs,
+      TemplateIDRange);
   if (Inst.isInvalid())
     return true;
 
-  MultiLevelTemplateArgumentList MLTAL;
-  MLTAL.addOuterTemplateArguments(TemplateArgs);
-
   for (const Expr *ConstraintExpr : ConstraintExprs) {
-    if (calculateConstraintSatisfaction(S, Template, TemplateArgs,
-                                        TemplateIDRange.getBegin(), MLTAL,
-                                        ConstraintExpr, Satisfaction))
+    ExprResult Res = calculateConstraintSatisfaction(
+        S, Template, TemplateIDRange.getBegin(), TemplateArgsList,
+        ConstraintExpr, Satisfaction);
+    if (Res.isInvalid())
       return true;
-    if (!Satisfaction.IsSatisfied)
-      // [temp.constr.op] p2
+
+    Converted.push_back(Res.get());
+    if (!Satisfaction.IsSatisfied) {
+      // Backfill the 'converted' list with nulls so we can keep the Converted
+      Converted.append(ConstraintExprs.size() - Converted.size(), nullptr);
+      // and unconverted lists in sync. [temp.constr.op] p2
       //   [...] To determine if a conjunction is satisfied, the satisfaction
       //   of the first operand is checked. If that is not satisfied, the
       //   conjunction is not satisfied. [...]
       return false;
+    }
   }
   return false;
 }
 
 bool Sema::CheckConstraintSatisfaction(
     const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
-    ArrayRef<TemplateArgument> TemplateArgs, SourceRange TemplateIDRange,
-    ConstraintSatisfaction &OutSatisfaction) {
+    llvm::SmallVectorImpl<Expr *> &ConvertedConstraints,
+    const MultiLevelTemplateArgumentList &TemplateArgsList,
+    SourceRange TemplateIDRange, ConstraintSatisfaction &OutSatisfaction) {
   if (ConstraintExprs.empty()) {
     OutSatisfaction.IsSatisfied = true;
     return false;
   }
+
+  ArrayRef<TemplateArgument> TemplateArgs =
+      TemplateArgsList.getNumSubstitutedLevels() > 0
+          ? TemplateArgsList.getOutermost()
+          : ArrayRef<TemplateArgument>{};
 
   llvm::FoldingSetNodeID ID;
   void *InsertPos;
@@ -334,8 +381,8 @@ bool Sema::CheckConstraintSatisfaction(
     Satisfaction = &OutSatisfaction;
   }
   if (::CheckConstraintSatisfaction(*this, Template, ConstraintExprs,
-                                    TemplateArgs, TemplateIDRange,
-                                    *Satisfaction)) {
+                                    ConvertedConstraints, TemplateArgsList,
+                                    TemplateIDRange, *Satisfaction)) {
     if (ShouldCache)
       delete Satisfaction;
     return true;
@@ -356,17 +403,69 @@ bool Sema::CheckConstraintSatisfaction(const Expr *ConstraintExpr,
       *this, ConstraintExpr, Satisfaction,
       [](const Expr *AtomicExpr) -> ExprResult {
         return ExprResult(const_cast<Expr *>(AtomicExpr));
-      });
+      }).isInvalid();
+}
+
+llvm::Optional<MultiLevelTemplateArgumentList>
+Sema::SetupConstraintCheckingTemplateArgumentsAndScope(
+    FunctionDecl *FD, llvm::Optional<ArrayRef<TemplateArgument>> TemplateArgs,
+    LocalInstantiationScope &Scope) {
+  MultiLevelTemplateArgumentList MLTAL;
+
+  MLTAL = getTemplateInstantiationArgs(FD, nullptr, /*RelativeToPrimary*/ true,
+                                       /*Pattern*/ nullptr,
+                                       /*LookBeyondLambda*/ true);
+
+  if (FD->isTemplateInstantiation() && FD->getPrimaryTemplate()) {
+    FunctionTemplateDecl *PrimaryTemplate = FD->getPrimaryTemplate();
+    InstantiatingTemplate Inst(
+        *this, FD->getPointOfInstantiation(),
+        InstantiatingTemplate::ConstraintsCheck{}, PrimaryTemplate,
+        TemplateArgs ? *TemplateArgs : ArrayRef<TemplateArgument>{},
+        SourceRange());
+    if (Inst.isInvalid())
+      return {};
+
+    if (TemplateArgs) {
+      MultiLevelTemplateArgumentList JustTemplArgs(
+          *FD->getTemplateSpecializationArgs());
+      if (addInstantiatedParametersToScope(
+              FD, PrimaryTemplate->getTemplatedDecl(), Scope, JustTemplArgs))
+        return {};
+    }
+
+    // If this is a member function, make sure we get the parameters that
+    // reference the original primary template.
+    if (const auto *FromMemTempl =
+            PrimaryTemplate->getInstantiatedFromMemberTemplate()) {
+      if (addInstantiatedParametersToScope(
+              FD, FromMemTempl ->getTemplatedDecl(), Scope, MLTAL))
+        return {};
+    }
+  }
+
+  return MLTAL;
 }
 
 bool Sema::CheckFunctionConstraints(const FunctionDecl *FD,
                                     ConstraintSatisfaction &Satisfaction,
                                     SourceLocation UsageLoc) {
-  const Expr *RC = FD->getTrailingRequiresClause();
-  if (RC->isInstantiationDependent()) {
+  // Don't check constraints if the function is dependent. Also don't check if
+  // this is a function template specialization, as the call to
+  // CheckinstantiatedFunctionTemplateConstraints after this will check it
+  // better.
+  if (FD->isDependentContext() ||
+      FD->getTemplatedKind() ==
+          FunctionDecl::TK_FunctionTemplateSpecialization) {
     Satisfaction.IsSatisfied = true;
     return false;
   }
+
+  LocalInstantiationScope Scope(*this);
+  llvm::Optional<MultiLevelTemplateArgumentList> MLTAL =
+      SetupConstraintCheckingTemplateArgumentsAndScope(
+          const_cast<FunctionDecl *>(FD), {}, Scope);
+
   Qualifiers ThisQuals;
   CXXRecordDecl *Record = nullptr;
   if (auto *Method = dyn_cast<CXXMethodDecl>(FD)) {
@@ -377,14 +476,27 @@ bool Sema::CheckFunctionConstraints(const FunctionDecl *FD,
   // We substitute with empty arguments in order to rebuild the atomic
   // constraint in a constant-evaluated context.
   // FIXME: Should this be a dedicated TreeTransform?
-  return CheckConstraintSatisfaction(
-      FD, {RC}, /*TemplateArgs=*/{},
+  const Expr *RC = FD->getTrailingRequiresClause();
+  llvm::SmallVector<Expr *, 1> Converted;
+
+  if (CheckConstraintSatisfaction(
+      FD, {RC}, Converted, *MLTAL,
       SourceRange(UsageLoc.isValid() ? UsageLoc : FD->getLocation()),
-      Satisfaction);
+      Satisfaction))
+    return true;
+
+  // Attn Reviewers: we need to do this for the function constraints for
+  // comparison of constraints to work, but do we also need to do it for
+  // CheckInstantiatedFunctionConstraints?  That one is more difficult, but we
+  // seem to always just pick up the constraints from the primary template.
+  assert(Converted.size() <= 1 && "Got more expressions converted?");
+  if (!Converted.empty() && Converted[0] != nullptr)
+    const_cast<FunctionDecl *>(FD)->setTrailingRequiresClause(Converted[0]);
+  return false;
 }
 
 bool Sema::EnsureTemplateArgumentListConstraints(
-    TemplateDecl *TD, ArrayRef<TemplateArgument> TemplateArgs,
+    TemplateDecl *TD, MultiLevelTemplateArgumentList TemplateArgs,
     SourceRange TemplateIDRange) {
   ConstraintSatisfaction Satisfaction;
   llvm::SmallVector<const Expr *, 3> AssociatedConstraints;
@@ -397,7 +509,8 @@ bool Sema::EnsureTemplateArgumentListConstraints(
     SmallString<128> TemplateArgString;
     TemplateArgString = " ";
     TemplateArgString += getTemplateArgumentBindingsText(
-        TD->getTemplateParameters(), TemplateArgs.data(), TemplateArgs.size());
+        TD->getTemplateParameters(), TemplateArgs.getInnermost().data(),
+        TemplateArgs.getInnermost().size());
 
     Diag(TemplateIDRange.getBegin(),
          diag::err_template_arg_list_constraints_not_satisfied)
@@ -429,21 +542,13 @@ bool Sema::CheckInstantiatedFunctionTemplateConstraints(
   Sema::ContextRAII savedContext(*this, Decl);
   LocalInstantiationScope Scope(*this);
 
-  // If this is not an explicit specialization - we need to get the instantiated
-  // version of the template arguments and add them to scope for the
-  // substitution.
-  if (Decl->isTemplateInstantiation()) {
-    InstantiatingTemplate Inst(*this, Decl->getPointOfInstantiation(),
-        InstantiatingTemplate::ConstraintsCheck{}, Decl->getPrimaryTemplate(),
-        TemplateArgs, SourceRange());
-    if (Inst.isInvalid())
-      return true;
-    MultiLevelTemplateArgumentList MLTAL(
-        *Decl->getTemplateSpecializationArgs());
-    if (addInstantiatedParametersToScope(
-            Decl, Decl->getPrimaryTemplate()->getTemplatedDecl(), Scope, MLTAL))
-      return true;
-  }
+  Optional<MultiLevelTemplateArgumentList> MLTAL =
+      SetupConstraintCheckingTemplateArgumentsAndScope(Decl, TemplateArgs,
+                                                       Scope);
+
+  if (!MLTAL)
+    return true;
+
   Qualifiers ThisQuals;
   CXXRecordDecl *Record = nullptr;
   if (auto *Method = dyn_cast<CXXMethodDecl>(Decl)) {
@@ -451,7 +556,8 @@ bool Sema::CheckInstantiatedFunctionTemplateConstraints(
     Record = Method->getParent();
   }
   CXXThisScopeRAII ThisScope(*this, Record, ThisQuals, Record != nullptr);
-  return CheckConstraintSatisfaction(Template, TemplateAC, TemplateArgs,
+  llvm::SmallVector<Expr *, 1> Converted;
+  return CheckConstraintSatisfaction(Template, TemplateAC, Converted, *MLTAL,
                                      PointOfInstantiation, Satisfaction);
 }
 

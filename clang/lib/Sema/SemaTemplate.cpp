@@ -4684,9 +4684,11 @@ Sema::CheckConceptTemplateId(const CXXScopeSpec &SS,
   bool AreArgsDependent =
       TemplateSpecializationType::anyDependentTemplateArguments(*TemplateArgs,
                                                                 Converted);
+  MultiLevelTemplateArgumentList MLTAL;
+  MLTAL.addOuterTemplateArguments(Converted);
   if (!AreArgsDependent &&
       CheckConstraintSatisfaction(
-          NamedConcept, {NamedConcept->getConstraintExpr()}, Converted,
+          NamedConcept, {NamedConcept->getConstraintExpr()}, MLTAL,
           SourceRange(SS.isSet() ? SS.getBeginLoc() : ConceptNameInfo.getLoc(),
                       TemplateArgs->getRAngleLoc()),
           Satisfaction))
@@ -5903,13 +5905,20 @@ bool Sema::CheckTemplateArgumentList(
   if (UpdateArgsWithConversions)
     TemplateArgs = std::move(NewArgs);
 
-  if (!PartialTemplateArgs &&
-      EnsureTemplateArgumentListConstraints(
-        Template, Converted, SourceRange(TemplateLoc,
-                                         TemplateArgs.getRAngleLoc()))) {
-    if (ConstraintsNotSatisfied)
-      *ConstraintsNotSatisfied = true;
-    return true;
+  if (!PartialTemplateArgs) {
+    TemplateArgumentList StackTemplateArgs(TemplateArgumentList::OnStack,
+                                           Converted);
+    MultiLevelTemplateArgumentList MLTAL = getTemplateInstantiationArgs(
+        Template, &StackTemplateArgs, /*RelativeToPrimary*/ true,
+        /*Pattern*/ nullptr,
+        /*LookBeyondLambda*/ true, /*IncludeContainingStruct*/ true);
+    if (EnsureTemplateArgumentListConstraints(
+            Template, MLTAL,
+            SourceRange(TemplateLoc, TemplateArgs.getRAngleLoc()))) {
+      if (ConstraintsNotSatisfied)
+        *ConstraintsNotSatisfied = true;
+      return true;
+    }
   }
 
   return false;
@@ -7437,9 +7446,28 @@ bool Sema::CheckTemplateTemplateArgument(TemplateTemplateParmDecl *Param,
       //   are not considered.
       if (ParamsAC.empty())
         return false;
+
       Template->getAssociatedConstraints(TemplateAC);
+
+      // Attn Reviewers: This works and fixes the constraint comparison issues,
+      // but I don't have a good idea why this is, nor if it is the 'right'
+      // thing.  I THINK it is pulling off the 'template template' level of the
+      // constraint, but I have no idea if that is the correct thing to do.
+      SmallVector<const Expr *, 3> ConvertedParamsAC;
+      TemplateArgumentList Empty(TemplateArgumentList::OnStack, {});
+      MultiLevelTemplateArgumentList MLTAL{Empty};
+      for (const auto *E : ParamsAC) {
+        // Both SubstExpr and SubstConstraintExpr work here, but I'm not sure
+        // which is correct. I THINK SubstConstraintExpr should be right, but I
+        // honestly have no idea.
+        ExprResult Res = SubstConstraintExpr(const_cast<Expr *>(E), MLTAL);
+        if (Res.isInvalid())
+          return true;
+        ConvertedParamsAC.push_back(Res.get());
+      }
+
       bool IsParamAtLeastAsConstrained;
-      if (IsAtLeastAsConstrained(Param, ParamsAC, Template, TemplateAC,
+      if (IsAtLeastAsConstrained(Param, ConvertedParamsAC, Template, TemplateAC,
                                  IsParamAtLeastAsConstrained))
         return true;
       if (!IsParamAtLeastAsConstrained) {

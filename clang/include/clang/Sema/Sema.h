@@ -7193,7 +7193,26 @@ private:
       LocalInstantiationScope &Scope,
       const MultiLevelTemplateArgumentList &TemplateArgs);
 
+  llvm::Optional<MultiLevelTemplateArgumentList>
+  SetupConstraintCheckingTemplateArgumentsAndScope(
+      FunctionDecl *FD, llvm::Optional<ArrayRef<TemplateArgument>> TemplateArgs,
+      LocalInstantiationScope &Scope);
+
+  // Keep track of whether we are evaluating a constraint.
+  unsigned ConstraintEvaluationDepth = 0;
+
+
+  class ConstraintEvalRAII {
+    Sema &S;
+  public:
+    ConstraintEvalRAII(Sema &S) : S(S) { ++S.ConstraintEvaluationDepth; }
+    ~ConstraintEvalRAII() { --S.ConstraintEvaluationDepth; }
+  };
+
 public:
+  bool IsEvaluatingAConstraint() {
+    return ConstraintEvaluationDepth > 0;
+  }
   const NormalizedConstraint *
   getNormalizedAssociatedConstraints(
       NamedDecl *ConstrainedDecl, ArrayRef<const Expr *> AssociatedConstraints);
@@ -7224,7 +7243,8 @@ public:
   /// \param ConstraintExprs a list of constraint expressions, treated as if
   /// they were 'AND'ed together.
   /// \param TemplateArgs the list of template arguments to substitute into the
-  /// constraint expression.
+  /// constraint expression, which is multi-level since we have to substitute
+  /// ALL levels for the purposes of checking. 
   /// \param TemplateIDRange The source range of the template id that
   /// caused the constraints check.
   /// \param Satisfaction if true is returned, will contain details of the
@@ -7234,7 +7254,18 @@ public:
   /// false otherwise.
   bool CheckConstraintSatisfaction(
       const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
-      ArrayRef<TemplateArgument> TemplateArgs,
+      const MultiLevelTemplateArgumentList &TemplateArgList,
+      SourceRange TemplateIDRange, ConstraintSatisfaction &Satisfaction) {
+    llvm::SmallVector<Expr*, 4> Converted;
+    return CheckConstraintSatisfaction(Template, ConstraintExprs, Converted,
+                                       TemplateArgList, TemplateIDRange,
+                                       Satisfaction);
+  }
+
+  bool CheckConstraintSatisfaction(
+      const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
+      llvm::SmallVectorImpl<Expr *> &ConvertedConstraints,
+      const MultiLevelTemplateArgumentList &TemplateArgList,
       SourceRange TemplateIDRange, ConstraintSatisfaction &Satisfaction);
 
   /// \brief Check whether the given non-dependent constraint expression is
@@ -7270,9 +7301,9 @@ public:
   ///
   /// \returns true if the constrains are not satisfied or could not be checked
   /// for satisfaction, false if the constraints are satisfied.
-  bool EnsureTemplateArgumentListConstraints(TemplateDecl *Template,
-                                       ArrayRef<TemplateArgument> TemplateArgs,
-                                             SourceRange TemplateIDRange);
+  bool EnsureTemplateArgumentListConstraints(
+      TemplateDecl *Template, MultiLevelTemplateArgumentList TemplateArgs,
+      SourceRange TemplateIDRange);
 
   /// \brief Emit diagnostics explaining why a constraint expression was deemed
   /// unsatisfied.
@@ -9011,7 +9042,8 @@ public:
 
   MultiLevelTemplateArgumentList getTemplateInstantiationArgs(
       const NamedDecl *D, const TemplateArgumentList *Innermost = nullptr,
-      bool RelativeToPrimary = false, const FunctionDecl *Pattern = nullptr);
+      bool RelativeToPrimary = false, const FunctionDecl *Pattern = nullptr,
+      bool LookBeyondLambda = false, bool IncludeContainingStruct = false);
 
   /// A context in which code is being synthesized (where a source location
   /// alone is not sufficient to identify the context). This covers template
@@ -9732,6 +9764,11 @@ public:
                       ExtParameterInfoBuilder &ParamInfos);
   ExprResult SubstExpr(Expr *E,
                        const MultiLevelTemplateArgumentList &TemplateArgs);
+  // Unlike the above, this evaluates constraints, which should only happen at
+  // 'constraint checking' time.
+  ExprResult
+  SubstConstraintExpr(Expr *E,
+                      const MultiLevelTemplateArgumentList &TemplateArgs);
 
   /// Substitute the given template arguments into a list of
   /// expressions, expanding pack expansions if required.
