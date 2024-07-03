@@ -2214,6 +2214,9 @@ ABIArgInfo X86_64ABIInfo::getIndirectReturnResult(QualType Ty) const {
     if (Ty->isBitIntType())
       return getNaturalAlignIndirect(Ty);
 
+    if (Ty->getAs<VectorType>() && getContext().getTypeSize(Ty) > 8 << 14)
+      return getNaturalAlignIndirect(Ty);
+
     return (isPromotableIntegerTypeForABI(Ty) ? ABIArgInfo::getExtend(Ty)
                                               : ABIArgInfo::getDirect());
   }

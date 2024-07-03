@@ -1956,6 +1956,11 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
              VT->getVectorKind() == VectorKind::RVVFixedLengthMask)
       // Adjust the alignment for fixed-length RVV vectors.
       Align = std::min<unsigned>(64, Width);
+    else if (uint64_t MaxAlign = 8 << 14; Align > MaxAlign) {
+      // The alignment size should not exceed 2^14 in bytes, otherwise it can
+      // NOT be properly lowered in backend.
+      Align = MaxAlign;
+    }
     break;
   }
 
